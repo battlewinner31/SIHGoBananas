@@ -1,35 +1,67 @@
 import json
-
-from fastapi import FastAPI, HTTPException, Depends
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 from typing import List
 
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    Depends,
+)
+
+from fastapi.middleware.cors import CORSMiddleware
+
+from pydantic import BaseModel
+
 from sqlalchemy.orm import Session
+
 from db.database import get_db
-from db.models import Startup, Challenge, Match, ReadinessAssessment, Pilot, KPI, Milestone, Decision
 
-from risk_evaluator import evaluate_startup_risk
+from db.models import (
+    Startup,
+    Challenge,
+    ChallengeRequirement,
+    Match,
+    ReadinessAssessment,
+    Pilot,
+    KPI,
+    Milestone,
+    Decision,
+)
 
+from extractor import (
+    structure_government_problem
+)
 
-from extractor import structure_government_problem
-from matcher import rank_startups, MOCK_STARTUP_DB
-from risk_evaluator import evaluate_startup_risk
+from matcher import (
+    rank_startups
+)
+
+from risk_evaluator import (
+    evaluate_startup_risk
+)
+
 from models import (
     ProblemSpecification,
     StartupMatchResult,
     InnovationReadinessReport,
 )
 
-app = FastAPI(title="SIH26136: Smart Matching & Structuring Engine")
 
-# --- CORS Middleware Configuration ---
+app = FastAPI(
+    title="SIH26136: Smart Matching & Structuring Engine"
+)
+
+
+# ============================================================
+# CORS
+# ============================================================
+
 origins = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
     "http://localhost:3000",
     "http://127.0.0.1:3000",
 ]
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -40,7 +72,10 @@ app.add_middleware(
 )
 
 
-# --- Schemas for Existing Matching Pipeline ---
+# ============================================================
+# REQUEST / RESPONSE SCHEMAS
+# ============================================================
+
 class MatchPipelineRequest(BaseModel):
     raw_department_statement: str
 
@@ -50,15 +85,31 @@ class MatchPipelineResponse(BaseModel):
     matched_candidates: List[StartupMatchResult]
 
 
-# --- Schemas for New Readiness + Risk AI ---
-class StartupAuditRequest(BaseModel):
-    problem_spec: ProblemSpecification
-    startup_id: str
+# ============================================================
+# HEALTH
+# ============================================================
 
-# --- Database Test Endpoint ---
-@app.get("/startups")
-def get_startups(db: Session = Depends(get_db)):
-    startups = db.query(Startup).all()
+@app.get("/api/v1/health")
+def health_check():
+
+    return {
+        "status": "ok",
+        "service": "SIH26136",
+    }
+
+
+# ============================================================
+# STARTUPS
+# ============================================================
+
+@app.get("/api/v1/startups")
+def get_startups(
+    db: Session = Depends(get_db)
+):
+
+    startups = db.query(
+        Startup
+    ).all()
 
     return [
         {
@@ -73,9 +124,19 @@ def get_startups(db: Session = Depends(get_db)):
         for startup in startups
     ]
 
-@app.get("/challenges")
-def get_challenges(db: Session = Depends(get_db)):
-    challenges = db.query(Challenge).all()
+
+# ============================================================
+# CHALLENGES
+# ============================================================
+
+@app.get("/api/v1/challenges")
+def get_challenges(
+    db: Session = Depends(get_db)
+):
+
+    challenges = db.query(
+        Challenge
+    ).all()
 
     return [
         {
@@ -90,330 +151,839 @@ def get_challenges(db: Session = Depends(get_db)):
     ]
 
 
-# --- Endpoint 1: Match & Structure (Discovery Stage) ---
-@app.post("/api/v1/process-demand", response_model=MatchPipelineResponse)
+# ============================================================
+# STAGE 1
+# PROCESS DEMAND + MATCH STARTUPS
+# ============================================================
+
+@app.post(
+    "/api/v1/process-demand",
+    response_model=MatchPipelineResponse,
+)
 async def process_demand(
     req: MatchPipelineRequest,
     challenge_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
-    structured_spec = structure_government_problem(
-        req.raw_department_statement
-    )
 
-    matches = rank_startups(structured_spec)
+    # --------------------------------------------------------
+    # Verify challenge
+    # --------------------------------------------------------
 
-    # Save matches to PostgreSQL
-    for match in matches:
-        db_match = Match(
-            challenge_id=challenge_id,
-            startup_id=match.startup_id,
-            match_score=match.scores.overall_match_score,
-            justification=match.match_justification
+    challenge = (
+        db.query(Challenge)
+        .filter(
+            Challenge.id == challenge_id
         )
-
-        db.add(db_match)
-
-    db.commit()
-
-    return MatchPipelineResponse(
-        structured_specification=structured_spec,
-        matched_candidates=matches,
+        .first()
     )
 
+    if not challenge:
 
-# --- Endpoint 2: Deep Readiness + Risk Audit (Due Diligence Stage) ---
-@app.post("/api/v1/audit-readiness", response_model=InnovationReadinessReport)
-async def audit_startup_readiness(req: StartupAuditRequest):
-    # 1. Search for the startup in the mock database
-    target_startup = next(
-        (s for s in MOCK_STARTUP_DB if s["id"] == req.startup_id), None
-    )
-
-    # 2. Return 404 if the requested startup ID does not exist
-    if not target_startup:
         raise HTTPException(
             status_code=404,
-            detail=f"Startup with ID '{req.startup_id}' not found in registry.",
+            detail=f"Challenge {challenge_id} not found",
         )
 
-    # 3. Perform the 5-dimension deep risk & readiness assessment
-    report = evaluate_startup_risk(req.problem_spec, target_startup)
-    return report
+    try:
 
-@app.get("/challenges/{challenge_id}/matches")
+        # ----------------------------------------------------
+        # Stage 1A: Gemini structuring
+        # ----------------------------------------------------
+
+        structured_spec = (
+            structure_government_problem(
+                req.raw_department_statement
+            )
+        )
+
+        # ----------------------------------------------------
+        # Stage 1B: Startup matching
+        # ----------------------------------------------------
+
+        matches = rank_startups(
+            structured_spec,
+            db
+        )
+
+        # ----------------------------------------------------
+        # Save Match records
+        # ----------------------------------------------------
+
+        for match in matches:
+
+            db_match = Match(
+                challenge_id=challenge_id,
+                startup_id=match.startup_id,
+                match_score=round(
+                    match.scores.overall_match_score
+                ),
+                justification=(
+                    match.match_justification
+                ),
+            )
+
+            db.add(db_match)
+
+            # Get generated database ID immediately.
+            db.flush()
+
+            # CRITICAL:
+            # Send Match ID to frontend.
+            match.match_id = db_match.id
+
+        db.commit()
+
+        return MatchPipelineResponse(
+            structured_specification=structured_spec,
+            matched_candidates=matches,
+        )
+
+    except HTTPException:
+        db.rollback()
+        raise
+
+    except Exception as e:
+
+        db.rollback()
+
+        print(
+            f"Process demand failed: {e}"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=str(e),
+        )
+
+
+# ============================================================
+# GET MATCHES FOR A CHALLENGE
+# ============================================================
+
+@app.get(
+    "/api/v1/challenges/{challenge_id}/matches"
+)
 def get_matches(
     challenge_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
-    matches = db.query(Match).filter(
-        Match.challenge_id == challenge_id
-    ).all()
+
+    matches = (
+        db.query(Match)
+        .filter(
+            Match.challenge_id == challenge_id
+        )
+        .order_by(
+            Match.match_score.desc()
+        )
+        .all()
+    )
 
     return matches
 
-@app.post("/matches/{match_id}/readiness")
+
+# ============================================================
+# STAGE 2
+# READINESS AUDIT
+# ============================================================
+
+@app.post(
+    "/api/v1/matches/{match_id}/readiness"
+)
 def create_readiness_assessment(
     match_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
-    # Get the match
-    match = db.query(Match).filter(
-        Match.id == match_id
-    ).first()
+
+    # --------------------------------------------------------
+    # Get match
+    # --------------------------------------------------------
+
+    match = (
+        db.query(Match)
+        .filter(
+            Match.id == match_id
+        )
+        .first()
+    )
 
     if not match:
+
         raise HTTPException(
             status_code=404,
-            detail="Match not found"
+            detail="Match not found",
         )
 
-    # Get the startup
-    startup = db.query(Startup).filter(
-        Startup.id == match.startup_id
-    ).first()
+    # --------------------------------------------------------
+    # Get startup
+    # --------------------------------------------------------
+
+    startup = (
+        db.query(Startup)
+        .filter(
+            Startup.id == match.startup_id
+        )
+        .first()
+    )
 
     if not startup:
+
         raise HTTPException(
             status_code=404,
-            detail="Startup not found"
+            detail="Startup not found",
         )
 
-    # Run the readiness AI
+    # --------------------------------------------------------
+    # Get challenge
+    # --------------------------------------------------------
+
+    challenge = (
+        db.query(Challenge)
+        .filter(
+            Challenge.id == match.challenge_id
+        )
+        .first()
+    )
+
+    if not challenge:
+
+        raise HTTPException(
+            status_code=404,
+            detail="Challenge not found",
+        )
+
+    # --------------------------------------------------------
+    # Get challenge requirements
+    # --------------------------------------------------------
+
+    requirements = (
+        db.query(ChallengeRequirement)
+        .filter(
+            ChallengeRequirement.challenge_id
+            == challenge.id
+        )
+        .all()
+    )
+
+    technical_requirements = [
+        item.requirement
+        for item in requirements
+    ]
+
+    # --------------------------------------------------------
+    # Build startup profile
+    # --------------------------------------------------------
+
     startup_profile = {
         "id": startup.id,
         "name": startup.name,
-        "dpiit_registered": startup.dpiit_registered,
+        "dpiit_registered": (
+            startup.dpiit_registered
+        ),
         "trl_level": startup.trl_level,
-        "past_deployments": startup.past_deployments,
-        "active_litigation": startup.active_litigation,
-        "capabilities": startup.capabilities,
+        "past_deployments": (
+            startup.past_deployments
+        ),
+        "active_litigation": (
+            startup.active_litigation
+        ),
+        "capabilities": (
+            startup.capabilities or ""
+        ),
     }
 
-    # For now, use the existing challenge
-    challenge = db.query(Challenge).filter(
-        Challenge.id == match.challenge_id
-    ).first()
-
-    if not challenge:
-        raise HTTPException(
-            status_code=404,
-            detail="Challenge not found"
-        )
+    # --------------------------------------------------------
+    # Build problem specification
+    # --------------------------------------------------------
 
     problem = ProblemSpecification(
         domain=challenge.domain,
+
         summary=challenge.description,
-        technical_requirements=[],
-        operational_constraints=[],
-        target_kpis=[],
-        pilot_duration_days=challenge.duration_days,
-        estimated_budget_inr=challenge.budget_inr,
+
+        technical_requirements=(
+            technical_requirements
+        ),
+
+        operational_constraints=[
+            f"Pilot duration: "
+            f"{challenge.duration_days} days."
+        ],
+
+        target_kpis=[
+            "Measure pilot performance against "
+            "baseline and target values."
+        ],
+
+        pilot_duration_days=(
+            challenge.duration_days
+        ),
+
+        estimated_budget_inr=(
+            challenge.budget_inr
+        ),
     )
+
+    # --------------------------------------------------------
+    # Run AI readiness evaluation
+    # --------------------------------------------------------
 
     report = evaluate_startup_risk(
         problem,
-        startup_profile
+        startup_profile,
     )
 
-    # Save AI result to PostgreSQL
+    # --------------------------------------------------------
+    # Save assessment
+    # --------------------------------------------------------
+
     assessment = ReadinessAssessment(
-    match_id=match.id,
-    overall_score=int(report.overall_readiness_score),
-    recommendation=report.recommendation,
-    findings=json.dumps({
-        "technical_capability": report.technical_capability.model_dump(),
-        "deployment_readiness": report.deployment_readiness.model_dump(),
-        "compliance_security": report.compliance_security.model_dump(),
-        "financial_sustainability": report.financial_sustainability.model_dump(),
-        "pilot_feasibility": report.pilot_feasibility.model_dump(),
-        "suggested_sandbox_safeguards": report.suggested_sandbox_safeguards,
-    }),
+        match_id=match.id,
+
+        overall_score=int(
+            round(
+                report.overall_readiness_score
+            )
+        ),
+
+        recommendation=(
+            report.recommendation
+        ),
+
+        findings=json.dumps(
+            {
+                "technical_capability":
+                    report.technical_capability.model_dump(),
+
+                "deployment_readiness":
+                    report.deployment_readiness.model_dump(),
+
+                "compliance_security":
+                    report.compliance_security.model_dump(),
+
+                "financial_sustainability":
+                    report.financial_sustainability.model_dump(),
+
+                "pilot_feasibility":
+                    report.pilot_feasibility.model_dump(),
+
+                "suggested_sandbox_safeguards":
+                    report.suggested_sandbox_safeguards,
+            }
+        ),
     )
 
     db.add(assessment)
+
     db.commit()
+
     db.refresh(assessment)
 
-    return assessment
+    return {
+        "id": assessment.id,
+        "match_id": assessment.match_id,
+        "overall_score": assessment.overall_score,
+        "recommendation": assessment.recommendation,
+        "findings": json.loads(
+            assessment.findings
+        ) if assessment.findings else {},
+    }
 
-@app.post("/pilots")
+
+# ============================================================
+# STAGE 3
+# CREATE PILOT
+# ============================================================
+
+@app.post(
+    "/api/v1/pilots"
+)
 def create_pilot(
     match_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
-    # Check that the match exists
-    match = db.query(Match).filter(Match.id == match_id).first()
+
+    # --------------------------------------------------------
+    # Verify match
+    # --------------------------------------------------------
+
+    match = (
+        db.query(Match)
+        .filter(
+            Match.id == match_id
+        )
+        .first()
+    )
 
     if not match:
-        raise HTTPException(status_code=404, detail="Match not found")
 
-    # Check that readiness assessment exists
+        raise HTTPException(
+            status_code=404,
+            detail="Match not found",
+        )
+
+    # --------------------------------------------------------
+    # Verify readiness
+    # --------------------------------------------------------
+
     readiness = (
         db.query(ReadinessAssessment)
-        .filter(ReadinessAssessment.match_id == match_id)
-        .order_by(ReadinessAssessment.id.desc())
+        .filter(
+            ReadinessAssessment.match_id
+            == match_id
+        )
+        .order_by(
+            ReadinessAssessment.id.desc()
+        )
         .first()
     )
 
     if not readiness:
+
         raise HTTPException(
             status_code=404,
-            detail="Readiness assessment not found"
+            detail=(
+                "Readiness assessment not found. "
+                "Run the readiness audit first."
+            ),
         )
 
+    # --------------------------------------------------------
+    # Prevent duplicate active pilot
+    # --------------------------------------------------------
+
+    existing_pilot = (
+        db.query(Pilot)
+        .filter(
+            Pilot.match_id == match_id
+        )
+        .order_by(
+            Pilot.id.desc()
+        )
+        .first()
+    )
+
+    if existing_pilot:
+
+        return existing_pilot
+
+    # --------------------------------------------------------
     # Create pilot
+    # --------------------------------------------------------
+
     pilot = Pilot(
         match_id=match_id,
-        status="PLANNED"
+        status="PLANNED",
     )
 
     db.add(pilot)
+
     db.commit()
+
     db.refresh(pilot)
 
     return pilot
 
-@app.post("/pilots/{pilot_id}/kpis")
+
+# ============================================================
+# GET PILOT
+# ============================================================
+
+@app.get(
+    "/api/v1/pilots/{pilot_id}"
+)
+def get_pilot(
+    pilot_id: int,
+    db: Session = Depends(get_db),
+):
+
+    pilot = (
+        db.query(Pilot)
+        .filter(
+            Pilot.id == pilot_id
+        )
+        .first()
+    )
+
+    if not pilot:
+
+        raise HTTPException(
+            status_code=404,
+            detail="Pilot not found",
+        )
+
+    return pilot
+
+
+# ============================================================
+# CREATE KPI
+# ============================================================
+
+@app.post(
+    "/api/v1/pilots/{pilot_id}/kpis"
+)
 def create_kpi(
     pilot_id: int,
     name: str,
     baseline: str,
     target: str,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
-    pilot = db.query(Pilot).filter(Pilot.id == pilot_id).first()
+
+    pilot = (
+        db.query(Pilot)
+        .filter(
+            Pilot.id == pilot_id
+        )
+        .first()
+    )
 
     if not pilot:
-        raise HTTPException(status_code=404, detail="Pilot not found")
+
+        raise HTTPException(
+            status_code=404,
+            detail="Pilot not found",
+        )
+
+    if not name.strip():
+
+        raise HTTPException(
+            status_code=400,
+            detail="KPI name cannot be empty",
+        )
 
     kpi = KPI(
         pilot_id=pilot_id,
-        name=name,
-        baseline=baseline,
-        target=target
+        name=name.strip(),
+        baseline=baseline.strip(),
+        target=target.strip(),
     )
 
     db.add(kpi)
+
     db.commit()
+
     db.refresh(kpi)
 
     return kpi
 
-@app.post("/kpis/{kpi_id}/result")
+
+# ============================================================
+# GET KPIS
+# ============================================================
+
+@app.get(
+    "/api/v1/pilots/{pilot_id}/kpis"
+)
+def get_kpis(
+    pilot_id: int,
+    db: Session = Depends(get_db),
+):
+
+    pilot = (
+        db.query(Pilot)
+        .filter(
+            Pilot.id == pilot_id
+        )
+        .first()
+    )
+
+    if not pilot:
+
+        raise HTTPException(
+            status_code=404,
+            detail="Pilot not found",
+        )
+
+    return (
+        db.query(KPI)
+        .filter(
+            KPI.pilot_id == pilot_id
+        )
+        .all()
+    )
+
+
+# ============================================================
+# UPDATE KPI RESULT
+# ============================================================
+
+@app.post(
+    "/api/v1/kpis/{kpi_id}/result"
+)
 def update_kpi_result(
     kpi_id: int,
     actual: str,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
-    kpi = db.query(KPI).filter(KPI.id == kpi_id).first()
+
+    kpi = (
+        db.query(KPI)
+        .filter(
+            KPI.id == kpi_id
+        )
+        .first()
+    )
 
     if not kpi:
-        raise HTTPException(status_code=404, detail="KPI not found")
 
-    kpi.actual = actual
+        raise HTTPException(
+            status_code=404,
+            detail="KPI not found",
+        )
+
+    kpi.actual = actual.strip()
 
     db.commit()
+
     db.refresh(kpi)
 
     return kpi
 
-@app.post("/pilots/{pilot_id}/milestones")
+
+# ============================================================
+# CREATE MILESTONE
+# ============================================================
+
+@app.post(
+    "/api/v1/pilots/{pilot_id}/milestones"
+)
 def create_milestone(
     pilot_id: int,
     title: str,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
-    pilot = db.query(Pilot).filter(Pilot.id == pilot_id).first()
+
+    pilot = (
+        db.query(Pilot)
+        .filter(
+            Pilot.id == pilot_id
+        )
+        .first()
+    )
 
     if not pilot:
-        raise HTTPException(status_code=404, detail="Pilot not found")
+
+        raise HTTPException(
+            status_code=404,
+            detail="Pilot not found",
+        )
+
+    if not title.strip():
+
+        raise HTTPException(
+            status_code=400,
+            detail="Milestone title cannot be empty",
+        )
 
     milestone = Milestone(
         pilot_id=pilot_id,
-        title=title,
-        status="PENDING"
+        title=title.strip(),
+        status="PENDING",
     )
 
     db.add(milestone)
+
     db.commit()
+
     db.refresh(milestone)
 
     return milestone
 
-@app.post("/milestones/{milestone_id}/complete")
+
+# ============================================================
+# GET MILESTONES
+# ============================================================
+
+@app.get(
+    "/api/v1/pilots/{pilot_id}/milestones"
+)
+def get_milestones(
+    pilot_id: int,
+    db: Session = Depends(get_db),
+):
+
+    pilot = (
+        db.query(Pilot)
+        .filter(
+            Pilot.id == pilot_id
+        )
+        .first()
+    )
+
+    if not pilot:
+
+        raise HTTPException(
+            status_code=404,
+            detail="Pilot not found",
+        )
+
+    return (
+        db.query(Milestone)
+        .filter(
+            Milestone.pilot_id == pilot_id
+        )
+        .all()
+    )
+
+
+# ============================================================
+# COMPLETE MILESTONE
+# ============================================================
+
+@app.post(
+    "/api/v1/milestones/{milestone_id}/complete"
+)
 def complete_milestone(
     milestone_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
+
     milestone = (
         db.query(Milestone)
-        .filter(Milestone.id == milestone_id)
+        .filter(
+            Milestone.id == milestone_id
+        )
         .first()
     )
 
     if not milestone:
+
         raise HTTPException(
             status_code=404,
-            detail="Milestone not found"
+            detail="Milestone not found",
         )
 
     milestone.status = "COMPLETED"
 
     db.commit()
+
     db.refresh(milestone)
 
     return milestone
 
-@app.post("/pilots/{pilot_id}/evaluation")
+#new logic added for pilot evaluation and final decision making
+
+def calculate_kpi_score(kpi):
+    """
+    Calculate KPI achievement from baseline, target and actual.
+
+    If target > baseline:
+        higher value is considered better.
+
+    If target < baseline:
+        lower value is considered better.
+
+    Returns a score from 0 to 100.
+    """
+
+    try:
+        baseline = float(kpi.baseline)
+        target = float(kpi.target)
+        actual = float(kpi.actual)
+    except (TypeError, ValueError):
+        return 0.0
+
+    if actual is None:
+        return 0.0
+
+    # No meaningful target change
+    if target == baseline:
+        return 100.0 if actual == target else 0.0
+
+    # Higher is better
+    if target > baseline:
+        progress = (
+            (actual - baseline)
+            / (target - baseline)
+        ) * 100
+
+    # Lower is better
+    else:
+        progress = (
+            (baseline - actual)
+            / (baseline - target)
+        ) * 100
+
+    return max(0.0, min(100.0, progress))
+
+# ============================================================
+# PILOT EVALUATION
+# ============================================================
+
+@app.post("/api/v1/pilots/{pilot_id}/evaluation")
 def evaluate_pilot(
     pilot_id: int,
     db: Session = Depends(get_db)
 ):
-    pilot = db.query(Pilot).filter(Pilot.id == pilot_id).first()
+    pilot = db.query(Pilot).filter(
+        Pilot.id == pilot_id
+    ).first()
 
     if not pilot:
-        raise HTTPException(status_code=404, detail="Pilot not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Pilot not found"
+        )
 
-    # Get KPIs for this pilot
-    kpis = db.query(KPI).filter(KPI.pilot_id == pilot_id).all()
+    kpis = db.query(KPI).filter(
+        KPI.pilot_id == pilot_id
+    ).all()
 
-    # Get milestones for this pilot
-    milestones = (
-        db.query(Milestone)
-        .filter(Milestone.pilot_id == pilot_id)
-        .all()
-    )
+    milestones = db.query(Milestone).filter(
+        Milestone.pilot_id == pilot_id
+    ).all()
 
-    # Count completed milestones
+    # -------------------------
+    # KPI SCORE
+    # -------------------------
+
+    kpi_scores = []
+
+    for kpi in kpis:
+        if kpi.actual is not None:
+            kpi_scores.append(
+                calculate_kpi_score(kpi)
+            )
+
+    measured_kpis = len(kpi_scores)
+    total_kpis = len(kpis)
+
+    if kpi_scores:
+        kpi_score = sum(kpi_scores) / len(kpi_scores)
+    else:
+        kpi_score = 0.0
+
+    # -------------------------
+    # MILESTONE SCORE
+    # -------------------------
+
     completed_milestones = sum(
-        1 for milestone in milestones
+        1
+        for milestone in milestones
         if milestone.status == "COMPLETED"
     )
 
-    # Count KPIs that have actual results
-    measured_kpis = sum(
-        1 for kpi in kpis
-        if kpi.actual is not None
-    )
-
-    total_kpis = len(kpis)
     total_milestones = len(milestones)
 
-    # Simple MVP evaluation
-    if total_kpis > 0:
-        kpi_score = (measured_kpis / total_kpis) * 100
-    else:
-        kpi_score = 0
+    milestone_score = (
+        (completed_milestones / total_milestones) * 100
+        if total_milestones > 0
+        else 0.0
+    )
 
-    if total_milestones > 0:
-        milestone_score = (
-            completed_milestones / total_milestones
-        ) * 100
-    else:
-        milestone_score = 0
+    # -------------------------
+    # OVERALL SCORE
+    # -------------------------
 
-    overall_score = (kpi_score + milestone_score) / 2
+    overall_score = (
+        (kpi_score + milestone_score) / 2
+    )
+
+    # -------------------------
+    # RECOMMENDATION
+    # -------------------------
 
     if overall_score >= 75:
         recommendation = "READY_TO_SCALE"
@@ -424,9 +994,9 @@ def evaluate_pilot(
 
     return {
         "pilot_id": pilot_id,
-        "kpi_score": kpi_score,
-        "milestone_score": milestone_score,
-        "overall_score": overall_score,
+        "kpi_score": round(kpi_score, 2),
+        "milestone_score": round(milestone_score, 2),
+        "overall_score": round(overall_score, 2),
         "recommendation": recommendation,
         "kpis_measured": measured_kpis,
         "total_kpis": total_kpis,
@@ -434,68 +1004,84 @@ def evaluate_pilot(
         "total_milestones": total_milestones
     }
 
-@app.post("/pilots/{pilot_id}/decision")
+# ============================================================
+# FINAL DECISION
+# ============================================================
+
+@app.post("/api/v1/pilots/{pilot_id}/decision")
 def create_final_decision(
     pilot_id: int,
     db: Session = Depends(get_db)
 ):
-    pilot = db.query(Pilot).filter(Pilot.id == pilot_id).first()
+    pilot = db.query(Pilot).filter(
+        Pilot.id == pilot_id
+    ).first()
 
     if not pilot:
-        raise HTTPException(status_code=404, detail="Pilot not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Pilot not found"
+        )
 
-    # Get KPIs
-    kpis = db.query(KPI).filter(KPI.pilot_id == pilot_id).all()
+    kpis = db.query(KPI).filter(
+        KPI.pilot_id == pilot_id
+    ).all()
 
-    # Get milestones
-    milestones = (
-        db.query(Milestone)
-        .filter(Milestone.pilot_id == pilot_id)
-        .all()
-    )
+    milestones = db.query(Milestone).filter(
+        Milestone.pilot_id == pilot_id
+    ).all()
 
-    # Check KPI completion
-    measured_kpis = sum(
-        1 for kpi in kpis
+    # KPI scores
+    kpi_scores = [
+        calculate_kpi_score(kpi)
+        for kpi in kpis
         if kpi.actual is not None
+    ]
+
+    kpi_score = (
+        sum(kpi_scores) / len(kpi_scores)
+        if kpi_scores
+        else 0.0
     )
 
-    # Check milestone completion
+    # Milestone score
     completed_milestones = sum(
-        1 for milestone in milestones
+        1
+        for milestone in milestones
         if milestone.status == "COMPLETED"
     )
 
-    total_kpis = len(kpis)
     total_milestones = len(milestones)
-
-    # Calculate scores
-    kpi_score = (
-        (measured_kpis / total_kpis) * 100
-        if total_kpis > 0
-        else 0
-    )
 
     milestone_score = (
         (completed_milestones / total_milestones) * 100
         if total_milestones > 0
-        else 0
+        else 0.0
     )
 
-    overall_score = (kpi_score + milestone_score) / 2
+    overall_score = (
+        (kpi_score + milestone_score) / 2
+    )
 
-    # Final government decision
     if overall_score >= 75:
         decision = "SCALE"
-        reason = "Pilot met the required KPI measurement and milestone completion threshold."
+        reason = (
+            "Pilot achieved the required performance "
+            "and milestone thresholds."
+        )
     elif overall_score >= 50:
         decision = "EXTEND_PILOT"
-        reason = "Pilot showed partial progress but requires additional validation."
+        reason = (
+            "Pilot showed partial performance and "
+            "requires additional validation."
+        )
     else:
         decision = "REJECT"
-        reason = "Pilot did not meet the minimum performance threshold."
+        reason = (
+            "Pilot did not achieve the required "
+            "performance threshold."
+        )
 
-    # Save decision
     final_decision = Decision(
         pilot_id=pilot_id,
         decision=decision,
@@ -508,8 +1094,8 @@ def create_final_decision(
 
     return {
         "pilot_id": pilot_id,
-        "decision": final_decision.decision,
-        "reason": final_decision.reason,
-        "overall_score": overall_score,
+        "decision": decision,
+        "reason": reason,
+        "overall_score": round(overall_score, 2),
         "id": final_decision.id
     }
